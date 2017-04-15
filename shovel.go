@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"gopkg.in/mgo.v2"
@@ -47,61 +50,34 @@ type Entry struct {
 	Op bson.M `bson:"o"`
 }
 
-type timestampLedger struct {
-	LastTimestamp bson.MongoTimestamp
-	count         int
-	freq          int
-	path          string
-}
-
-// records every `freq` timestamp to the ledger
-func (t *timestampLedger) Record(Ts bson.MongoTimestamp) error {
-	t.LastTimestamp = Ts
-	t.count++
-	if t.freq == t.count {
-		err := ioutil.WriteFile(t.path, []byte(strconv.FormatInt(int64(t.LastTimestamp), 16)), 0644)
-		if err != nil {
-			return err
-		}
-		t.count = 0
-	}
-	return nil
-}
-
-func (t *timestampLedger) Query() interface{} {
-	if t.LastTimestamp == 0 {
-		return nil
-	}
-	return bson.M{"ts": bson.M{"$gt": t.LastTimestamp}}
-}
-
-func parseLedger() *timestampLedger {
-	path := *ledgerFlag
-	freq := *ledgerFreqFlag
-
-	var i int64
-	data, err := ioutil.ReadFile(path)
-	if err == nil {
-		i, err = strconv.ParseInt(string(data), 16, 64)
-	}
-	if err != nil && !os.IsNotExist(err) {
-		log.Fatal(err)
-	}
-
-	return &timestampLedger{
-		path:          path,
-		LastTimestamp: bson.MongoTimestamp(i),
-		freq:          freq,
-	}
-}
-
-func parseSession() *mgo.Session {
-	session, err := mgo.Dial(*uriFlag)
+func parseSession(uri string) (*mgo.Session, error) {
+	session, err := mgo.Dial(uri)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	log.Printf("Connected to %v", *uriFlag)
-	return session
+	return session, nil
+}
+
+func queryFunc(session *mgo.Session) (func(bson.MongoTimestamp) *mgo.Iter, error) {
+	db := session.DB(localDbName)
+	names, err := db.CollectionNames()
+	if err != nil {
+		return nil, err
+	}
+	if !contains(names, oplogCollName) {
+		return nil, errors.New("No oplog found; is this a replica set member?")
+	}
+	coll := db.C(oplogCollName)
+
+	return func(ts bson.MongoTimestamp) *mgo.Iter {
+		var query bson.M
+		if ts != 0 {
+			query = bson.M{"ts": bson.M{"$gt": ts}}
+		}
+		log.Printf("querying with %v", query)
+		return coll.Find(query).Sort("$natural").Tail(5 * time.Second)
+	}, nil
 }
 
 func contains(strings []string, needle string) bool {
@@ -113,60 +89,109 @@ func contains(strings []string, needle string) bool {
 	return false
 }
 
-func read(session *mgo.Session, ledger *timestampLedger, work func(Entry)) {
-	db := session.DB(localDbName)
-	names, err := db.CollectionNames()
+func load(path string) (bson.MongoTimestamp, error) {
+	var i int64
+	data, err := ioutil.ReadFile(path)
+
+	if err == nil {
+		i, err = strconv.ParseInt(string(data), 16, 64)
+	} else if os.IsNotExist(err) {
+		err = nil // ignore ENOENT
+	}
+
+	return bson.MongoTimestamp(i), err
+}
+
+func write(path string, ts bson.MongoTimestamp) error {
+	err := ioutil.WriteFile(path, []byte(strconv.FormatInt(int64(ts), 16)), 0644)
 	if err != nil {
-		log.Fatalf("Error getting collection names: %v", err)
+		log.Printf("failed to persist ts %v: %v", ts, err)
 	}
-
-	if !contains(names, oplogCollName) {
-		log.Fatal("No oplog found; is this a replica set member?")
-	}
-	coll := db.C(oplogCollName)
-
-	query := ledger.Query()
-	log.Printf("querying with %v", query)
-	iter := coll.Find(query).Sort("$natural").Tail(5 * time.Second)
-	defer iter.Close()
-
-	for {
-		result := Entry{}
-
-		for iter.Next(&result) {
-			work(result)
-
-			err := ledger.Record(result.Timestamp)
-			if err != nil {
-				log.Fatal(err)
-			}
-		}
-
-		if err := iter.Err(); err != nil {
-			log.Fatalf("Got an error from the iterator: %v", err)
-		}
-
-		if iter.Timeout() {
-			log.Print("Iterator timed out")
-			continue
-		}
-
-		query = ledger.Query()
-		log.Printf("Requerying with query: %v", query)
-		iter = coll.Find(query).Sort("$natural").Tail(timeout)
-	}
+	return err
 }
 
 func dispatch(entry Entry) {
 	log.Printf("Received: %v", entry)
 }
 
-func main() {
-	flag.Parse()
-	ledger := parseLedger()
-
-	session := parseSession()
+func handle(session *mgo.Session, path string, freq int, stop func() bool) error {
 	defer session.Close()
 
-	read(session, ledger, dispatch)
+	ts, err := load(path)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if ts != 0 {
+			write(path, ts)
+		}
+	}()
+
+	queryFor, err := queryFunc(session)
+	if err != nil {
+		return nil
+	}
+
+	iter := queryFor(ts)
+
+	var entry Entry
+	var counter int
+	for {
+		for !stop() && iter.Next(&entry) {
+			dispatch(entry)
+			ts = entry.Timestamp
+
+			counter = (counter + 1) % freq
+			if counter == 0 {
+				log.Print("Persisting timestamp")
+				write(path, ts)
+			}
+		}
+
+		if err := iter.Err(); err != nil {
+			return err
+		}
+
+		if !stop() && iter.Timeout() {
+			log.Print("Iterator timed out")
+			continue
+		}
+
+		if stop() {
+			log.Print("Shutting down cleanly")
+			return nil
+		}
+
+		iter = queryFor(ts)
+	}
+}
+
+func makeStop() func() bool {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+
+	var stopped bool
+	return func() bool {
+		if !stopped {
+			select {
+			case sig := <-sigs:
+				stopped = true
+				log.Printf("Received %v, marking stopped", sig)
+			default:
+				stopped = false
+			}
+		}
+		return stopped
+	}
+}
+
+func main() {
+	flag.Parse()
+
+	session, err := parseSession(*uriFlag)
+	if err != nil {
+		log.Fatalf("Failed parsing session: %v", err)
+	}
+
+	handle(session, *ledgerFlag, *ledgerFreqFlag, makeStop())
 }
