@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -62,7 +63,8 @@ func queryFunc(session *mgo.Session) (func(bson.MongoTimestamp) *mgo.Iter, error
 	db := session.DB(localDbName)
 	names, err := db.CollectionNames()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed reading collection names from %v: %v", localDbName,
+			err)
 	}
 	if !contains(names, oplogCollName) {
 		return nil, errors.New("No oplog found; is this a replica set member?")
@@ -90,34 +92,31 @@ func contains(strings []string, needle string) bool {
 
 func load(path string) (bson.MongoTimestamp, error) {
 	data, err := ioutil.ReadFile(path)
-
+	if err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("erred loading path %v: %v", path, err)
+	}
 	var ts bson.MongoTimestamp
-	if err == nil {
-		err = bson.UnmarshalJSON(data, &ts)
-	} else if os.IsNotExist(err) {
-		err = nil // ignore ENOENT
+	if err = bson.UnmarshalJSON(data, &ts); err != nil {
+		return 0, fmt.Errorf("Failed unmarshaling data from %v: %v", path, err)
 	}
-	if err != nil {
-		return 0, err
-	}
-	return ts, err
+	return ts, nil
 }
 
 func write(path string, ts bson.MongoTimestamp) error {
 	data, err := bson.MarshalJSON(ts)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed marshalling to json: %v", err)
 	}
 	err = ioutil.WriteFile(path, data, 0644)
 	if err != nil {
-		log.Printf("failed to persist ts %v: %v", ts, err)
-		return err
+		return fmt.Errorf("failed to persist ts %v: %v", ts, err)
 	}
 	return nil
 }
 
-func read(queryFunc func(bson.MongoTimestamp) *mgo.Iter, ts bson.MongoTimestamp) <-chan Entry {
+func read(queryFunc func(bson.MongoTimestamp) *mgo.Iter, ts bson.MongoTimestamp) (<-chan Entry, <-chan error) {
 	entries := make(chan Entry)
+	errs := make(chan error)
 	go func() {
 		iter := queryFunc(ts)
 		var entry Entry
@@ -128,8 +127,7 @@ func read(queryFunc func(bson.MongoTimestamp) *mgo.Iter, ts bson.MongoTimestamp)
 			}
 
 			if err := iter.Err(); err != nil {
-				log.Printf("Received an error: %v", err)
-				close(entries)
+				errs <- fmt.Errorf("From db: %v", err)
 				return
 			}
 
@@ -141,10 +139,14 @@ func read(queryFunc func(bson.MongoTimestamp) *mgo.Iter, ts bson.MongoTimestamp)
 			iter = queryFunc(ts)
 		}
 	}()
-	return entries
+	return entries, errs
 }
 
-func run(session *mgo.Session, path string, freq int) error {
+func run(uri string, path string, freq int) error {
+	session, err := parseSession(uri)
+	if err != nil {
+		return err
+	}
 	defer session.Close()
 
 	ts, err := load(path)
@@ -162,7 +164,8 @@ func run(session *mgo.Session, path string, freq int) error {
 	if err != nil {
 		return err
 	}
-	entries := read(queryFor, ts)
+
+	entries, errors := read(queryFor, ts)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
@@ -171,19 +174,17 @@ func run(session *mgo.Session, path string, freq int) error {
 	for {
 		select {
 		case sig := <-sigs:
-			log.Printf("Receive signal: %v", sig)
+			log.Printf("Receive %v; shutting down", sig)
 			return nil
-		case entry, ok := <-entries:
-			if !ok {
-				log.Printf("No more entries")
-				return nil
-			}
+		case entry := <-entries:
 			log.Printf("Received entry: %v", entry)
 			ts = entry.Timestamp
 			counter = (counter + 1) % freq
 			if counter == 0 {
 				write(path, ts)
 			}
+		case err := <-errors:
+			return err
 		}
 	}
 }
@@ -191,10 +192,7 @@ func run(session *mgo.Session, path string, freq int) error {
 func main() {
 	flag.Parse()
 
-	session, err := parseSession(*uriFlag)
-	if err != nil {
-		log.Fatalf("Failed parsing session: %v", err)
+	if err := run(*uriFlag, *pathFlag, *freqFlag); err != nil {
+		log.Fatalf("Error: %v", err)
 	}
-
-	run(session, *pathFlag, *freqFlag)
 }
