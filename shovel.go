@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -16,8 +15,8 @@ import (
 )
 
 var uriFlag = flag.String("uri", "mongodb://localhost:27017", "a mongodb connection uri")
-var ledgerFlag = flag.String("ledgerPath", "/tmp/ledger", "where to store the progress record")
-var ledgerFreqFlag = flag.Int("freq", 100, "how often to store progress")
+var pathFlag = flag.String("ledgerPath", "/tmp/ledger", "where to store the progress record")
+var freqFlag = flag.Int("freq", 100, "how often to store progress")
 
 const (
 	localDbName   = "local"
@@ -90,37 +89,69 @@ func contains(strings []string, needle string) bool {
 }
 
 func load(path string) (bson.MongoTimestamp, error) {
-	var i int64
 	data, err := ioutil.ReadFile(path)
 
+	var ts bson.MongoTimestamp
 	if err == nil {
-		i, err = strconv.ParseInt(string(data), 16, 64)
+		err = bson.UnmarshalJSON(data, &ts)
 	} else if os.IsNotExist(err) {
 		err = nil // ignore ENOENT
 	}
-
-	return bson.MongoTimestamp(i), err
+	if err != nil {
+		return 0, err
+	}
+	return ts, err
 }
 
 func write(path string, ts bson.MongoTimestamp) error {
-	err := ioutil.WriteFile(path, []byte(strconv.FormatInt(int64(ts), 16)), 0644)
+	data, err := bson.MarshalJSON(ts)
+	if err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(path, data, 0644)
 	if err != nil {
 		log.Printf("failed to persist ts %v: %v", ts, err)
+		return err
 	}
-	return err
+	return nil
 }
 
-func dispatch(entry Entry) {
-	log.Printf("Received: %v", entry)
+func read(queryFunc func(bson.MongoTimestamp) *mgo.Iter, ts bson.MongoTimestamp) <-chan Entry {
+	entries := make(chan Entry)
+	go func() {
+		iter := queryFunc(ts)
+		var entry Entry
+		for {
+			for iter.Next(&entry) {
+				entries <- entry
+				ts = entry.Timestamp
+			}
+
+			if err := iter.Err(); err != nil {
+				log.Printf("Received an error: %v", err)
+				close(entries)
+				return
+			}
+
+			if iter.Timeout() {
+				log.Print("Iterator timed out")
+				continue
+			}
+
+			iter = queryFunc(ts)
+		}
+	}()
+	return entries
 }
 
-func handle(session *mgo.Session, path string, freq int, stop func() bool) error {
+func run(session *mgo.Session, path string, freq int) error {
 	defer session.Close()
 
 	ts, err := load(path)
 	if err != nil {
-		return nil
+		return err
 	}
+
 	defer func() {
 		if ts != 0 {
 			write(path, ts)
@@ -129,59 +160,31 @@ func handle(session *mgo.Session, path string, freq int, stop func() bool) error
 
 	queryFor, err := queryFunc(session)
 	if err != nil {
-		return nil
+		return err
 	}
+	entries := read(queryFor, ts)
 
-	iter := queryFor(ts)
-
-	var entry Entry
-	var counter int
-	for {
-		for !stop() && iter.Next(&entry) {
-			dispatch(entry)
-			ts = entry.Timestamp
-
-			counter = (counter + 1) % freq
-			if counter == 0 {
-				log.Print("Persisting timestamp")
-				write(path, ts)
-			}
-		}
-
-		if err := iter.Err(); err != nil {
-			return err
-		}
-
-		if !stop() && iter.Timeout() {
-			log.Print("Iterator timed out")
-			continue
-		}
-
-		if stop() {
-			log.Print("Shutting down cleanly")
-			return nil
-		}
-
-		iter = queryFor(ts)
-	}
-}
-
-func makeStop() func() bool {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	var stopped bool
-	return func() bool {
-		if !stopped {
-			select {
-			case sig := <-sigs:
-				stopped = true
-				log.Printf("Received %v, marking stopped", sig)
-			default:
-				stopped = false
+	var counter int
+	for {
+		select {
+		case sig := <-sigs:
+			log.Printf("Receive signal: %v", sig)
+			return nil
+		case entry, ok := <-entries:
+			if !ok {
+				log.Printf("No more entries")
+				return nil
+			}
+			log.Printf("Received entry: %v", entry)
+			ts = entry.Timestamp
+			counter = (counter + 1) % freq
+			if counter == 0 {
+				write(path, ts)
 			}
 		}
-		return stopped
 	}
 }
 
@@ -193,5 +196,5 @@ func main() {
 		log.Fatalf("Failed parsing session: %v", err)
 	}
 
-	handle(session, *ledgerFlag, *ledgerFreqFlag, makeStop())
+	run(session, *pathFlag, *freqFlag)
 }
